@@ -1,0 +1,25 @@
+{
+  "name": "haunted-empire-website",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node creator-leaderboards.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tygoodguy50/haunted-empire-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Tygoodguy50/haunted-empire-backend/issues"
+  },
+  "homepage": "https://github.com/Tygoodguy50/haunted-empire-backend#readme",
+  "description": "",
+  "dependencies": {
+    "express": "^5.1.0",
+    "stripe": "^18.3.0"
+  }
+}
