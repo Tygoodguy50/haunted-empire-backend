@@ -10,6 +10,8 @@ const https = require('https');
 require('dotenv').config(); // Load environment variables
 
 const PORT = process.env.PORT_CREATOR_LEADERBOARDS || 8085;
+// Discord notification helper
+const { notifyDiscord } = require('./billing/jobs');
 
 // Stripe configuration
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || 'sk_test_...';
@@ -20,8 +22,25 @@ const STRIPE_TEST_MODE = STRIPE_SECRET_KEY?.startsWith('sk_test_') || false;
 // Stripe webhook signing secret
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || 'whsec_Ph3aYXGMzEqYbhas3IWzEhhgw47GxY7O';
 
+// Admin key from environment variable
+const ADMIN_KEY = process.env.ADMIN_KEY;
+
+// Helper function to check admin access
+function isAdmin(requestKey) {
+// Example: Notify on leaderboard milestone
+function notifyMilestone(userId, milestone) {
+  notifyDiscord({ type: 'milestone', message: `🏆 User ${userId} reached milestone: ${milestone}` });
+}
+    return requestKey === ADMIN_KEY;
+}
+
 // Helper: get raw body for webhook verification
 function getRawBody(req) {
+// Example usage: call notifyMilestone when a user reaches a milestone
+// notifyMilestone('user123', 'Top 10 leaderboard');
+process.on('uncaughtException', (err) => {
+  notifyDiscord({ type: 'error', message: `Creator Leaderboards error: ${err.message}` });
+});
     return new Promise((resolve, reject) => {
         let data = '';
         req.on('data', chunk => { data += chunk; });
@@ -520,6 +539,79 @@ const server = http.createServer((req, res) => {
                 },
                 timestamp: new Date().toISOString()
             }));
+
+        } else if (url.pathname === '/admin') {
+            // Improved admin endpoint with error handling and example actions
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                let requestKey = null;
+                let data = {};
+                try {
+                    data = body ? JSON.parse(body) : {};
+                } catch (e) {
+                    // Ignore parse error, fallback to header
+                }
+                requestKey = data.admin_key || req.headers['x-admin-key'];
+
+                if (!requestKey) {
+                    res.writeHead(400);
+                    res.end(JSON.stringify({
+                        error: 'Missing admin key',
+                        timestamp: new Date().toISOString()
+                    }));
+                    return;
+                }
+
+                if (!isAdmin(requestKey)) {
+                    res.writeHead(403);
+                    res.end(JSON.stringify({
+                        error: 'Forbidden',
+                        message: 'Invalid admin key',
+                        timestamp: new Date().toISOString()
+                    }));
+                    return;
+                }
+
+                // Example: support admin actions
+                const action = data.action || req.headers['x-admin-action'];
+                let result = null;
+                if (action === 'stats') {
+                    result = {
+                        service: 'Creator Leaderboards',
+                        creators: creators.length,
+                        uptime: process.uptime(),
+                        timestamp: new Date().toISOString()
+                    };
+                } else if (action === 'sync') {
+                    syncAllCreatorsWithStripe().then(() => {
+                        res.writeHead(200);
+                        res.end(JSON.stringify({
+                            success: true,
+                            message: 'Stripe sync triggered',
+                            timestamp: new Date().toISOString()
+                        }));
+                    }).catch(error => {
+                        res.writeHead(500);
+                        res.end(JSON.stringify({
+                            error: 'Sync failed',
+                            message: error.message,
+                            timestamp: new Date().toISOString()
+                        }));
+                    });
+                    return;
+                } else {
+                    result = {
+                        success: true,
+                        message: 'Admin access granted',
+                        availableActions: ['stats', 'sync'],
+                        timestamp: new Date().toISOString()
+                    };
+                }
+                res.writeHead(200);
+                res.end(JSON.stringify(result));
+            });
+            return;
             
         } else if (url.pathname === '/creators') {
             const limit = parseInt(url.searchParams.get('limit')) || 10;
