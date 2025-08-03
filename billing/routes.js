@@ -55,7 +55,37 @@ router.post('/enterprise/onboard', async (req, res) => {
 });
 const { createCharge, refundCharge } = require('./stripe');
 
-// Add payment routes here
+// Stripe webhook status endpoint
+// Checks if Stripe webhook is configured and returns status
+router.get('/stripe-webhook-status', async (req, res) => {
+  try {
+    // Simulate advanced Stripe webhook status check
+    // In production, use Stripe API to list webhooks and check for expected endpoint
+    const stripeSecret = process.env.STRIPE_SECRET_KEY;
+    if (!stripeSecret) {
+      notifyDiscord({ type: 'webhook', message: 'Stripe secret key missing in env' });
+      return res.status(500).json({ status: 'error', message: 'Stripe secret key not configured' });
+    }
+    // Optionally, check for webhook endpoint in DB or config
+    const webhooksCol = await getCollection('stripe_webhooks');
+    const allWebhooks = await webhooksCol.find({}).toArray();
+    console.log('All webhooks:', allWebhooks);
+    const webhook = await webhooksCol.findOne({ active: true });
+    console.log('Found webhook:', webhook);
+    if (!webhook) {
+      notifyDiscord({ type: 'webhook', message: 'No active Stripe webhook found' });
+      return res.status(404).json({ status: 'not_found', message: 'No active Stripe webhook registered' });
+    }
+    // Optionally, check last event received
+    const lastEvent = webhook.lastEvent || null;
+    notifyDiscord({ type: 'webhook', message: `Stripe webhook status checked: ${webhook.url}` });
+    res.json({ status: 'ok', webhook: { url: webhook.url, lastEvent } });
+  } catch (err) {
+    notifyDiscord({ type: 'error', message: `Stripe webhook status error: ${err.message}` });
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 // Create a payment charge
 router.post('/pay', async (req, res) => {
   try {
