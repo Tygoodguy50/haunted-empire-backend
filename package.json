@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node creator-leaderboards.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "test": "echo \"No tests yet\" && exit 0"
   },
   "repository": {
     "type": "git",
