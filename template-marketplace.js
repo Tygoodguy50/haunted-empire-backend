@@ -1,3 +1,6 @@
+// Add /test-connect route to main app if not already present
+const consultingRouter = require('./consulting');
+app.use('/', consultingRouter);
 // Placeholder for Template Marketplace API endpoints
 const express = require('express');
 const router = express.Router();

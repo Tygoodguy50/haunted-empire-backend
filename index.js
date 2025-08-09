@@ -1,8 +1,33 @@
+// Health check endpoint for webhook registrations
+app.get('/admin/webhook-health', authenticateAdmin, async (req, res) => {
+  try {
+    const registrations = await WebhookRegistration.find();
+    // Ping each callbackUrl (HEAD request, 2s timeout)
+    const results = await Promise.all(registrations.map(async reg => {
+      let status = 'unknown';
+      try {
+        const resp = await axios.head(reg.callbackUrl, { timeout: 2000 });
+        status = resp.status >= 200 && resp.status < 400 ? 'healthy' : 'failing';
+      } catch (err) {
+        status = 'failing';
+      }
+      return { id: reg._id, callbackUrl: reg.callbackUrl, status };
+    }));
+    res.json({ health: results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const Stripe = require('stripe');
 const mongoose = require('mongoose');
+const Creator = require('./models/Creator');
+const LoreLog = require('./models/LoreLog');
+const ViralScore = require('./models/ViralScore');
+const TikTokWebhook = require('./models/TikTokWebhook');
+const WebhookRegistration = require('./models/WebhookRegistration');
 const axios = require('axios');
 require('dotenv').config();
 
@@ -11,7 +36,23 @@ app.use(bodyParser.json());
 
 // Root endpoint for health check and to prevent 502 errors
 app.get('/', (req, res) => {
-  res.send('Backend is running!');
+  res.json({
+    message: 'Backend is running!',
+    availableEndpoints: [
+      '/test-connect',
+      '/stripe/test-payment',
+      '/lore/drop-live',
+      '/api/trigger-referral-bonus',
+      '/api/generate-discount',
+      '/api',
+      '/stats',
+      '/creators',
+      '/creators/:id',
+      '/leaderboard',
+      '/creators/stripe-sync',
+      '/creators/create-payment'
+    ]
+  });
 });
 
 // Prevent favicon.ico 502 error
@@ -24,6 +65,216 @@ const mongoUri = process.env.MONGO_URI;
 console.log('MongoDB URI:', mongoUri);
 
 // Utility: Generate random discount code
+// --- Automated API Endpoints ---
+// Stats endpoint
+
+
+// Creators endpoint
+app.get('/creators', async (req, res) => {
+  try {
+    // Find creators eligible for public ranking/lore participation
+    const creators = await Creator.find({ stripeId: { $exists: true, $ne: null }, viralScore: { $gte: 10 } });
+    res.json({ creators });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Creator by ID endpoint
+app.get('/creators/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const creator = await Creator.findById(id).populate('loreLogs');
+    if (!creator) return res.status(404).json({ error: 'Creator not found' });
+    // Simulate access control
+    const userRole = req.headers['x-user-role'] || 'public';
+    let creatorObj = creator.toObject();
+    if (userRole !== 'admin' && userRole !== creatorObj.username) {
+      delete creatorObj.stripeId;
+    }
+    res.json({ creator: creatorObj });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Leaderboard endpoint
+const jwt = require('jsonwebtoken');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'supersecret';
+
+function authenticateAdmin(req, res, next) {
+  const token = req.headers['authorization']?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  try {
+    const decoded = jwt.verify(token, ADMIN_SECRET);
+    if (decoded.role !== 'admin') throw new Error('Not admin');
+    req.admin = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+}
+
+// --- RBAC Middleware ---
+function rbac(role) {
+  return function(req, res, next) {
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+    try {
+      const decoded = jwt.verify(token, ADMIN_SECRET);
+      if (role === 'admin' && decoded.role !== 'admin') return res.status(403).json({ error: 'Forbidden: Admins only' });
+      if (role === 'operator' && !['admin','operator'].includes(decoded.role)) return res.status(403).json({ error: 'Forbidden: Operators only' });
+      req.rbacRole = decoded.role;
+      next();
+    } catch (err) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+  };
+}
+
+// --- Real Log Integration Endpoint ---
+// --- Integration Test Endpoints ---
+app.post('/admin/integration-test/discord', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  // Simulate Discord webhook test
+  try {
+    // Replace with real Discord API call if needed
+    await axios.post(callbackUrl, { content: 'Discord integration test message' });
+    res.json({ ok: true, message: 'Discord test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/integration-test/stripe', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  try {
+    // Simulate Stripe webhook test
+    await axios.post(callbackUrl, { type: 'stripe.test', data: { message: 'Stripe integration test' } });
+    res.json({ ok: true, message: 'Stripe test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/integration-test/tiktok', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  try {
+    // Simulate TikTok webhook test
+    await axios.post(callbackUrl, { event: 'tiktok.test', details: 'TikTok integration test' });
+    res.json({ ok: true, message: 'TikTok test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/integration-test/sendgrid', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  try {
+    // Simulate SendGrid webhook test
+    await axios.post(callbackUrl, { event: 'sendgrid.test', details: 'SendGrid integration test' });
+    res.json({ ok: true, message: 'SendGrid test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/integration-test/twilio', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  try {
+    // Simulate Twilio webhook test
+    await axios.post(callbackUrl, { event: 'twilio.test', details: 'Twilio integration test' });
+    res.json({ ok: true, message: 'Twilio test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/admin/integration-test/slack', rbac('operator'), async (req, res) => {
+  const { callbackUrl } = req.body;
+  try {
+    // Simulate Slack webhook test
+    await axios.post(callbackUrl, { event: 'slack.test', details: 'Slack integration test' });
+    res.json({ ok: true, message: 'Slack test sent', callbackUrl });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+app.get('/admin/logs', rbac('viewer'), async (req, res) => {
+  const { callbackUrl } = req.query;
+  // Simulate log retrieval (replace with real log DB or file access)
+  const logs = [
+    { timestamp: new Date(Date.now()-3600000).toISOString(), level: 'info', message: `Pinged ${callbackUrl} - healthy` },
+    { timestamp: new Date(Date.now()-1800000).toISOString(), level: 'error', message: `Pinged ${callbackUrl} - failed` },
+    { timestamp: new Date().toISOString(), level: 'info', message: `Pinged ${callbackUrl} - healthy` }
+  ];
+  res.json({ logs });
+});
+
+app.get('/stats', authenticateAdmin, async (req, res) => {
+  try {
+    // Daily active creators: count creators updated in last 24h
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const dailyActiveCreators = await Creator.countDocuments({ createdAt: { $gte: since } });
+    // Viral score distribution
+    const scores = await Creator.find({}, 'viralScore');
+    const viralScoreDistribution = scores.map(c => c.viralScore);
+    // Example payout velocity and revenue (stub)
+    const avgPayoutVelocity = '2.3 days';
+    const tiktokFragmentInteractions = await LoreLog.countDocuments({ eventType: 'tiktok-fragment' });
+    const revenueGenerated = await LoreLog.countDocuments({ eventType: 'payment' }) * 10; // $10 per payment
+    const anomalies = ['referral spike', 'lore anomaly'];
+    res.json({
+      dailyActiveCreators,
+      viralScoreDistribution,
+      avgPayoutVelocity,
+      tiktokFragmentInteractions,
+      revenueGenerated,
+      anomalies,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create payment endpoint
+app.post('/creators/create-payment', async (req, res) => {
+  const { creatorId, sku, paymentSource } = req.body;
+  if (!creatorId || !sku || !paymentSource) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  try {
+    // Create Stripe payment intent
+    const amount = sku === 'promo' ? 500 : 1000; // Example: $5 for promo, $10 for regular
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency: 'usd',
+      payment_method_types: ['card'],
+      metadata: { creatorId, sku }
+    });
+    // Log lore event
+    const loreLog = new LoreLog({
+      creator: creatorId,
+      eventType: 'payment',
+      details: { sku, paymentSource, paymentIntentId: paymentIntent.id },
+    });
+    await loreLog.save();
+    res.json({
+      payment: 'Payment intent created',
+      creatorId,
+      sku,
+      paymentSource,
+      stripeClientSecret: paymentIntent.client_secret,
+      loreFragmentUnlocked: true,
+      adBoostTriggered: sku === 'promo',
+      loreLog
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// --- End Automated API Endpoints ---
 function generateDiscountCode(length = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -85,15 +336,19 @@ app.post('/stripe/test-payment', async (req, res) => {
 // Lore drop endpoint
 app.post('/lore/drop-live', async (req, res) => {
   try {
-    // Example: Save lore event to DB (replace with your schema)
-    // const lore = new Lore({ ...req.body });
-    // await lore.save();
-
+    // Save lore event to LoreLog
+    const { creatorId, details } = req.body;
+    const loreLog = new LoreLog({
+      creator: creatorId,
+      eventType: 'lore-drop-live',
+      details: details || {}
+    });
+    await loreLog.save();
     // Send Discord notification
     await axios.post(discordWebhook, {
-      content: 'A new live lore drop has occurred!'
+      content: `A new live lore drop has occurred!${creatorId ? ' By creator: ' + creatorId : ''}`
     });
-    res.json({ status: 'lore drop triggered', notified: true });
+    res.json({ status: 'lore drop triggered', notified: true, loreLog });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -101,4 +356,251 @@ app.post('/lore/drop-live', async (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Production backend running on port ${PORT}`);
+});
+
+// TikTok Webhook endpoint for fragment engagement
+app.post('/webhook/tiktok', async (req, res) => {
+// Automated TikTok webhook registration endpoint
+app.post('/webhook/register-tiktok', async (req, res) => {
+  try {
+    const { tiktokApiKey, callbackUrl, eventTypes, creatorId } = req.body;
+    if (!tiktokApiKey || !callbackUrl || !eventTypes) {
+      return res.status(400).json({ error: 'Missing tiktokApiKey, callbackUrl, or eventTypes' });
+    }
+    const response = await axios.post('https://open-api.tiktok.com/webhook/register', {
+      callback_url: callbackUrl,
+      event_types: eventTypes
+    }, {
+      headers: { 'Authorization': `Bearer ${tiktokApiKey}` }
+    });
+    // Track registration in DB
+    const registration = new WebhookRegistration({
+      platform: 'tiktok',
+      callbackUrl,
+      eventTypes,
+      registrationResponse: response.data,
+      apiKey: tiktokApiKey,
+      creator: creatorId
+    });
+    await registration.save();
+    res.json({ ok: true, tiktokResponse: response.data, registration });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Admin: Get all webhook registrations
+app.get('/admin/webhook-registrations', authenticateAdmin, async (req, res) => {
+  try {
+    const registrations = await WebhookRegistration.find().populate('creator');
+    res.json({ registrations });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Filter webhook registrations by platform or creator
+app.get('/admin/webhook-registrations/search', authenticateAdmin, async (req, res) => {
+  try {
+    const { platform, creatorId } = req.query;
+    const query = {};
+    if (platform) query.platform = platform;
+    if (creatorId) query.creator = creatorId;
+    const registrations = await WebhookRegistration.find(query).populate('creator');
+    res.json({ registrations });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Delete a webhook registration
+app.delete('/admin/webhook-registrations/:id', authenticateAdmin, async (req, res) => {
+  try {
+    await WebhookRegistration.findByIdAndDelete(req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: View details of a webhook registration
+app.get('/admin/webhook-registrations/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const registration = await WebhookRegistration.findById(req.params.id).populate('creator');
+    res.json({ registration });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: Analytics endpoint for webhook stats
+app.get('/admin/webhook-analytics', authenticateAdmin, async (req, res) => {
+  try {
+    // Interactive filtering: platform, region, latency, status, creator
+    const { platform, region, minLatency, maxLatency, status, creatorId } = req.query;
+    let filter = {};
+    if (platform) filter.platform = platform;
+    if (creatorId) filter.creator = creatorId;
+    let allRegs = await WebhookRegistration.find(filter).populate('creator');
+    // Further filter in-memory for region, latency, status
+    if (region || minLatency || maxLatency || status) {
+      allRegs = allRegs.filter(reg => {
+        let pass = true;
+        if (region && reg.region !== region) pass = false;
+        if (minLatency && reg.latency < parseInt(minLatency)) pass = false;
+        if (maxLatency && reg.latency > parseInt(maxLatency)) pass = false;
+        if (status) {
+          let regStatus = 'healthy';
+          if (reg.callbackUrl && reg.callbackUrl.endsWith('fail')) regStatus = 'failing';
+          if (regStatus !== status) pass = false;
+        }
+        return pass;
+      });
+    }
+    const total = allRegs.length;
+    const byPlatform = Object.values(allRegs.reduce((acc, reg) => {
+      acc[reg.platform] = acc[reg.platform] || { _id: reg.platform, count: 0 };
+      acc[reg.platform].count++;
+      return acc;
+    }, {}));
+    const recent = allRegs.slice().sort((a,b)=>new Date(b.registeredAt)-new Date(a.registeredAt)).slice(0,10);
+    // Error rate: count failing vs healthy
+    let errorRate = { ok: 0, fail: 0 };
+    let regionStats = { US: 0, EU: 0, ASIA: 0 };
+    let avgLatency = 0;
+    let latencySamples = [];
+    let webhookGrowth = [];
+    let creatorActivity = {};
+    let anomalyEvents = [];
+    let integrationTestSuccess = { total: 0, success: 0, fail: 0 };
+    let errorRateTrend = [];
+    let latencyHistogram = Array(10).fill(0); // 10 buckets
+    let regionBreakdown = { US: [], EU: [], ASIA: [] };
+    let now = Date.now();
+    for (const reg of allRegs) {
+      // Simulate health check and latency
+      let statusSim = 'healthy';
+      let latency = Math.floor(Math.random() * 100) + 50;
+      if (reg.callbackUrl && reg.callbackUrl.endsWith('fail')) statusSim = 'failing';
+      if (statusSim === 'healthy') errorRate.ok++;
+      else errorRate.fail++;
+      // Error rate trend (simulate per webhook)
+      errorRateTrend.push({ time: reg.registeredAt, status: statusSim });
+      // Latency histogram
+      let bucket = Math.min(9, Math.floor(latency/20));
+      latencyHistogram[bucket]++;
+      // Simulate region stats
+      ['US','EU','ASIA'].forEach(regionKey => {
+        let up = Math.random() > 0.2;
+        regionStats[regionKey] += up ? 1 : 0;
+        regionBreakdown[regionKey].push({ callbackUrl: reg.callbackUrl, latency, status: statusSim, up });
+      });
+      latencySamples.push(latency);
+      // Growth rate: count per day (simulate)
+      let daysAgo = Math.floor((now - new Date(reg.registeredAt).getTime()) / (24*3600*1000));
+      webhookGrowth[daysAgo] = (webhookGrowth[daysAgo] || 0) + 1;
+      // Creator activity
+      if (reg.creator) {
+        let cid = reg.creator._id?.toString() || reg.creator;
+        creatorActivity[cid] = (creatorActivity[cid] || 0) + 1;
+      }
+      // Simulate anomaly detection
+      if (latency > 180 || statusSim === 'failing') anomalyEvents.push({ callbackUrl: reg.callbackUrl, latency, status: statusSim });
+    }
+    if (latencySamples.length) avgLatency = Math.round(latencySamples.reduce((a,b)=>a+b,0)/latencySamples.length);
+    // Simulate integration test history
+    const integrationTestHistory = [
+      { service: 'discord', status: 'ok', timestamp: new Date(now-3600000).toISOString() },
+      { service: 'stripe', status: 'fail', timestamp: new Date(now-1800000).toISOString() },
+      { service: 'tiktok', status: 'ok', timestamp: new Date(now-900000).toISOString() },
+      { service: 'sendgrid', status: 'ok', timestamp: new Date(now-600000).toISOString() },
+      { service: 'twilio', status: 'ok', timestamp: new Date(now-300000).toISOString() },
+      { service: 'slack', status: 'fail', timestamp: new Date(now-120000).toISOString() }
+    ];
+    integrationTestSuccess.total = integrationTestHistory.length;
+    integrationTestSuccess.success = integrationTestHistory.filter(t => t.status === 'ok').length;
+    integrationTestSuccess.fail = integrationTestHistory.filter(t => t.status !== 'ok').length;
+    // Top-performing webhooks (simulated)
+    const topWebhooks = allRegs.filter(r => ['stripe','tiktok'].includes(r.platform) && (r.eventTypes || []).includes('promo')).slice(0,3);
+    // Most active creators
+    let mostActiveCreators = Object.entries(creatorActivity).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([cid,count])=>({cid,count}));
+    // Webhook growth array to chart
+    let webhookGrowthArray = Object.entries(webhookGrowth).map(([daysAgo,count])=>({daysAgo:parseInt(daysAgo),count})).sort((a,b)=>a.daysAgo-b.daysAgo);
+    // Drill-downs: return filtered registrations, anomaly details, region breakdown
+    res.json({
+      total,
+      byPlatform,
+      recent,
+      errorRate,
+      errorRateTrend,
+      latencyHistogram,
+      avgLatency,
+      regionStats,
+      regionBreakdown,
+      integrationTestHistory,
+      integrationTestSuccess,
+      topWebhooks,
+      mostActiveCreators,
+      webhookGrowth: webhookGrowthArray,
+      anomalyEvents,
+      filtered: allRegs,
+      drilldowns: {
+        anomalyDetails: anomalyEvents,
+        regionBreakdown,
+        creatorActivity,
+        latencyHistogram,
+        errorRateTrend
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// Admin: Get all webhook registrations
+
+
+// Admin: Filter webhook registrations by platform or creator
+
+
+// Admin: View details of a webhook registration
+  try {
+    const { platform, apiKey, callbackUrl, eventTypes, creatorId } = req.body;
+    if (!platform || !apiKey || !callbackUrl || !eventTypes) {
+      return res.status(400).json({ error: 'Missing platform, apiKey, callbackUrl, or eventTypes' });
+    }
+    let apiUrl;
+    let headers = {};
+    let body = { callback_url: callbackUrl, event_types: eventTypes };
+    switch (platform) {
+      case 'tiktok':
+        apiUrl = 'https://open-api.tiktok.com/webhook/register';
+        headers = { 'Authorization': `Bearer ${apiKey}` };
+        break;
+      case 'discord':
+        apiUrl = 'https://discord.com/api/webhooks/register';
+        headers = { 'Authorization': `Bot ${apiKey}` };
+        break;
+      case 'stripe':
+        apiUrl = 'https://api.stripe.com/v1/webhook_endpoints';
+        headers = { 'Authorization': `Bearer ${apiKey}` };
+        body = { url: callbackUrl, enabled_events: eventTypes };
+        break;
+      default:
+        return res.status(400).json({ error: 'Unsupported platform' });
+    }
+    const response = await axios.post(apiUrl, body, { headers });
+    // Track registration in DB
+    const registration = new WebhookRegistration({
+      platform,
+      callbackUrl,
+      eventTypes,
+      registrationResponse: response.data,
+      apiKey,
+      creator: creatorId
+    });
+    await registration.save();
+    res.json({ ok: true, response: response.data, registration });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });

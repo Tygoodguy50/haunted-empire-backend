@@ -1,6 +1,11 @@
-// Placeholder for Consulting Services API endpoints
+// Consulting Services API endpoints and health check
 const express = require('express');
 const router = express.Router();
+
+// Health check endpoint for frontend validation
+router.get('/test-connect', (req, res) => {
+  res.json({ status: 'ok', env: process.env.NODE_ENV || 'production' });
+});
 
 // List consulting packages
 router.get('/consulting', (req, res) => {
