@@ -1,3 +1,112 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const Stripe = require('stripe');
+const crypto = require('crypto');
+const mongoose = require('mongoose');
+const Creator = require('./models/Creator');
+const LoreLog = require('./models/LoreLog');
+const ViralScore = require('./models/ViralScore');
+const TikTokWebhook = require('./models/TikTokWebhook');
+const WebhookRegistration = require('./models/WebhookRegistration');
+const Purchase = require('./models/Purchase');
+const axios = require('axios');
+require('dotenv').config();
+
+const app = express();
+
+// --- Load product catalog early so webhook logic can access real unit amounts ---
+const path = require('path');
+let productCatalog = [];
+try {
+  const catalogPath = path.join(__dirname,'products','catalog.json');
+  productCatalog = require(catalogPath);
+  console.log(`[catalog] Loaded ${productCatalog.length} products from catalog.json`);
+} catch (err) {
+  console.warn('[catalog] Could not load catalog.json:', err.message);
+}
+function findProduct(id){ return productCatalog.find(p=>p.id===id); }
+
+// Stripe webhook MUST be registered before generic JSON parser so raw body is preserved
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req,res)=>{
+  try {
+    let event;
+    const sig = req.headers['stripe-signature'];
+    if(process.env.STRIPE_WEBHOOK_SECRET && sig){
+      try {
+        event = Stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+      } catch(err){
+        console.error('[stripe webhook] signature verification failed', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+      }
+    } else {
+      event = JSON.parse(req.body.toString());
+    }
+    if(event.type === 'checkout.session.completed'){
+      const session = event.data.object;
+      try {
+        let integrityValid = true;
+        let purchaseDoc = { productId: session.metadata?.productId || null, amount: session.amount_total, currency: session.currency, mode: session.mode, raw: session };
+        if(session.metadata?.bulk === '1'){
+          purchaseDoc.bulk = true;
+          const itemsMeta = (session.metadata.items||'').split(',').filter(Boolean).map(s=>{
+            const [pid,qty] = s.split(':');
+            return { productId: pid, quantity: Number(qty)||1 };
+          });
+          // Normalize per-line pricing from catalog (fallback to proportional if missing)
+          const totalQty = itemsMeta.reduce((a,i)=>a+i.quantity,0) || 1;
+          let fallbackPerUnit = Math.floor(session.amount_total / totalQty);
+          purchaseDoc.items = itemsMeta.map(it=>{
+            const product = findProduct(it.productId);
+            const unitAmount = product?.amount ?? fallbackPerUnit;
+            return { productId: it.productId, quantity: it.quantity, unitAmount, lineTotal: unitAmount * it.quantity };
+          });
+          if(session.metadata.integrity){
+            // Rebuild hash base the same way it was constructed in bulk checkout endpoint (id x qty : amount)
+            const base = purchaseDoc.items.map(it=>`${it.productId}x${it.quantity}:${it.unitAmount}`).join('|');
+            const expectedBulk = crypto.createHash('sha256').update(base,'utf8').digest('hex').slice(0,24);
+            if(expectedBulk !== session.metadata.integrity){
+              integrityValid = false;
+              console.warn('[stripe webhook] bulk integrity mismatch', { sessionId: session.id, expected: expectedBulk, got: session.metadata.integrity });
+            }
+            purchaseDoc.integrity = session.metadata.integrity;
+          }
+        } else if(session.metadata?.integrity){
+          const expected = crypto.createHash('sha256').update(`${session.metadata.productId}|${session.amount_total}`,'utf8').digest('hex').slice(0,16);
+          if(expected !== session.metadata.integrity){
+            integrityValid = false;
+            console.warn('[stripe webhook] integrity mismatch', { sessionId: session.id, productId: session.metadata?.productId, expected, got: session.metadata.integrity });
+          }
+          purchaseDoc.integrity = session.metadata.integrity;
+        }
+        purchaseDoc.integrityValid = integrityValid;
+        await Purchase.findOneAndUpdate({ sessionId: session.id },{ $set: purchaseDoc },{ upsert: true });
+        const loreLog = new LoreLog({
+          eventType:'payment',
+          details: { sessionId: session.id, productId: session.metadata?.productId, amount_total: session.amount_total },
+        });
+        await loreLog.save();
+      } catch(dbErr){ console.error('[stripe webhook] save error', dbErr.message); }
+    } else if(event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      try {
+        const loreLog = new LoreLog({
+          eventType: 'subscription_renewal',
+          details: { invoiceId: invoice.id, subscription: invoice.subscription, amount_paid: invoice.amount_paid, customer: invoice.customer }
+        });
+        await loreLog.save();
+      } catch(e){ console.error('[stripe webhook] renewal save error', e.message); }
+    }
+    res.json({ received:true });
+  } catch(err){
+    console.error('[stripe webhook] error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Generic JSON parser AFTER webhook
+app.use(bodyParser.json());
+
+
 // Health check endpoint for webhook registrations
 app.get('/admin/webhook-health', authenticateAdmin, async (req, res) => {
   try {
@@ -18,21 +127,6 @@ app.get('/admin/webhook-health', authenticateAdmin, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-const express = require('express');
-const bodyParser = require('body-parser');
-const Stripe = require('stripe');
-const mongoose = require('mongoose');
-const Creator = require('./models/Creator');
-const LoreLog = require('./models/LoreLog');
-const ViralScore = require('./models/ViralScore');
-const TikTokWebhook = require('./models/TikTokWebhook');
-const WebhookRegistration = require('./models/WebhookRegistration');
-const axios = require('axios');
-require('dotenv').config();
-
-const app = express();
-app.use(bodyParser.json());
 
 // Root endpoint for health check and to prevent 502 errors
 app.get('/', (req, res) => {
@@ -319,6 +413,19 @@ app.get('/test-connect', (req, res) => {
   res.json({ status: 'ok', env: process.env.NODE_ENV || 'production' });
 });
 
+// Product catalog endpoint (public)
+app.get('/api/catalog', (req,res)=> {
+  res.json({ products: productCatalog.map(p=>({
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    amount: p.amount,
+    currency: p.currency,
+    interval: p.interval || null,
+    paymentLink: p.paymentLink || null
+  })) });
+});
+
 // Stripe payment test endpoint
 app.post('/stripe/test-payment', async (req, res) => {
   try {
@@ -329,6 +436,76 @@ app.post('/stripe/test-payment', async (req, res) => {
     });
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Create Stripe Checkout Session from catalog productId
+app.post('/api/create-checkout-session', async (req,res)=>{
+  try {
+    const { productId, successUrl, cancelUrl, quantity = 1 } = req.body;
+    if(!productId) return res.status(400).json({ error:'Missing productId' });
+    const product = findProduct(productId);
+    if(!product) return res.status(404).json({ error:'Unknown product' });
+    if(!process.env.STRIPE_SECRET_KEY) return res.status(500).json({ error:'Stripe not configured' });
+    // If paymentLink defined and no need dynamic session, return link directly for simplicity
+    if(product.paymentLink && !req.body.forceSession){
+      return res.json({ url: product.paymentLink, mode:'link' });
+    }
+    const lineItem = {
+      price_data: {
+        currency: product.currency || 'usd',
+        product_data: { name: product.name },
+        unit_amount: product.amount,
+        recurring: product.interval ? { interval: product.interval } : undefined
+      },
+      quantity
+    };
+    const integrity = crypto.createHash('sha256').update(`${product.id}|${product.amount}`,'utf8').digest('hex').slice(0,16);
+    const session = await stripe.checkout.sessions.create({
+      mode: product.interval ? 'subscription':'payment',
+      line_items:[lineItem],
+      success_url: successUrl || 'https://example.com/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl || 'https://example.com/cancel',
+      metadata: { productId: product.id, catalogVersion: 'v1', integrity }
+    });
+    res.json({ url: session.url, id: session.id, mode: session.mode });
+  } catch(err){
+    console.error('[checkout-session] error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Bulk (multi-item) checkout session (non-subscription items only for now)
+app.post('/api/create-checkout-session-bulk', async (req,res)=>{
+  try {
+    const { items, successUrl, cancelUrl } = req.body;
+    if(!Array.isArray(items) || items.length===0) return res.status(400).json({ error:'Missing items array' });
+    const resolved = [];
+    for(const it of items){
+      if(!it || !it.productId) return res.status(400).json({ error:'Each item needs productId' });
+      const product = findProduct(it.productId);
+      if(!product) return res.status(404).json({ error:`Unknown product ${it.productId}` });
+      if(product.interval) return res.status(400).json({ error:'Subscriptions not supported in bulk endpoint yet' });
+      resolved.push({ product, quantity: it.quantity && it.quantity>0 ? it.quantity:1 });
+    }
+    const line_items = resolved.map(r=>({
+      price_data:{ currency:r.product.currency||'usd', product_data:{ name:r.product.name }, unit_amount:r.product.amount },
+      quantity:r.quantity
+    }));
+    const hashBase = resolved.map(r=>`${r.product.id}x${r.quantity}:${r.product.amount}`).join('|');
+    const integrity = crypto.createHash('sha256').update(hashBase,'utf8').digest('hex').slice(0,24);
+    const session = await stripe.checkout.sessions.create({
+      mode:'payment',
+      line_items,
+      success_url: successUrl || 'https://example.com/success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl || 'https://example.com/cancel',
+      metadata:{ bulk:'1', items: resolved.map(r=>`${r.product.id}:${r.quantity}`).join(','), integrity }
+    });
+    res.json({ url: session.url, id: session.id, mode: session.mode });
+  } catch(err){
+    console.error('[bulk-checkout] error', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -351,6 +528,25 @@ app.post('/lore/drop-live', async (req, res) => {
     res.json({ status: 'lore drop triggered', notified: true, loreLog });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Health endpoint (added for deployment monitoring)
+app.get('/health', async (req, res) => {
+  try {
+    const mongoStatus = (mongoose.connection && mongoose.connection.readyState === 1) ? 'connected' : 'disconnected';
+    // Minimal Stripe key presence check (do not expose key)
+    const stripeConfigured = !!process.env.STRIPE_SECRET_KEY;
+    res.json({
+      status: 'ok',
+      service: 'haunted-empire-backend',
+      version: '1.0.0',
+      time: new Date().toISOString(),
+      mongo: mongoStatus,
+      stripe: stripeConfigured ? 'configured' : 'missing'
+    });
+  } catch (e) {
+    res.status(500).json({ status: 'error', error: e.message });
   }
 });
 
@@ -604,3 +800,29 @@ app.get('/admin/webhook-analytics', authenticateAdmin, async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+// Replace simple findProduct with alias aware version
+const PRODUCT_ALIASES = {
+  'templates':'templates-bundle',
+  'publishing':'from-draft-to-published',
+  'business':'horror-that-sells',
+  'generator':'plot-generator',
+  'draft-to-published-course':'from-draft-to-published'
+};
+function findProduct(id){
+  const canonical = PRODUCT_ALIASES[id] || id;
+  return productCatalog.find(p=>p.id===canonical);
+}
+
+// Scheduled reconciliation block
+if(process.env.ENABLE_PAYMENT_RECONCILIATION === 'true' && !global.__RECONCILIATION_SCHED){
+  global.__RECONCILIATION_SCHED = true;
+  const { spawn } = require('child_process');
+  const path = require('path');
+  const intervalMs = Number(process.env.RECONCILIATION_INTERVAL_MS || 6*60*60*1000);
+  setInterval(()=>{
+    console.log('[reconciliation] starting scheduled run');
+    const proc = spawn(process.execPath, [path.join(__dirname,'scripts','reconcile-payments.js')], { stdio:'inherit' });
+    proc.on('exit', code=> console.log('[reconciliation] completed with code', code));
+  }, intervalMs).unref();
+}
