@@ -1,2 +1,3 @@
 # Ignore environment files containing secrets
 .env
+.netlify/
